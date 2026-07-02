@@ -1,97 +1,57 @@
-# claude-usage-watcher
+<div align="center">
 
-A tool that watches Claude Code activity, tracks when your 5-hour usage
-window (and, once seeded, the weekly cap) will reset, and pushes a phone
-notification the moment it does — via a Telegram bot, delivered by a cloud
-one-shot timer (Upstash QStash) so it fires **on time even if your laptop is
-closed or asleep**. No browser, no manually checking claude.ai. Get pinged,
-go back to work.
+# 🔔 claude-usage-watcher
+
+**Stop refreshing claude.ai. Get pinged the instant your usage limit resets.**
+
+Tracks Claude Code's 5-hour usage window locally and delivers a phone
+notification the moment it resets — even if your laptop is closed, asleep,
+or off.
+
+`macOS` · `zero dependencies` · `Telegram` · `Upstash QStash`
+
+</div>
+
+---
+
+## Why
+
+Anthropic doesn't publish a "your limit just reset" webhook. This tool
+infers the reset time locally from one documented fact — the 5-hour window
+always resets exactly 5 hours after your first message — the instant a
+Claude Code hook sees that first message. No polling, no browser, no
+manually checking a usage page.
+
+## Features
+
+- **Event-driven, not polling** — a Claude Code hook computes the reset
+  time the moment a new window opens
+- **Cloud-delivered** — [Upstash QStash](https://upstash.com/docs/qstash)
+  fires the push straight to Telegram at the exact second; your laptop is
+  out of the loop the instant the alarm is scheduled
+- **Delivery-confirmed, not fire-and-forget** — verifies the message
+  actually reached Telegram, with an automatic fallback if it didn't
+- **Self-correcting** — one command reconciles drift the moment you spot
+  it against the real countdown
+- **Zero dependencies** — one Python file, standard library only, nothing
+  to `pip install`, ever
 
 ## How it works
 
-**The 5-hour window** is a fixed timer anchored to the first message of a
-new window: it resets exactly 5 hours later, no matter how much you use
-inside that window. That makes the reset time fully computable *if* this
-tool sees your first message of each window — which it does, via a Claude
-Code hook. It has a blind spot for usage that happens purely through the
-claude.ai web/mobile app, since those don't fire local hooks; use `correct`
-to hand it a real observed timestamp whenever you have one, and that
-correction wins until it itself expires.
+```
+Claude Code hook  →  claude_usage_watcher.py  →  Upstash QStash  →  Telegram
+   (this Mac)          (computes reset_at)        (cloud alarm)      (your phone)
+```
 
-> **⚠️ Disclaimer: the in-app/CLI countdown is always the source of truth,
-> not this tool.** This was hit directly during setup — the tool's
-> `inferred` reset time was off from what Claude Code's own interface
-> showed by over an hour, because the tool only starts counting from
-> whenever a hook *first happens to fire*, which isn't necessarily the true
-> start of your current window (e.g. if hooks were registered mid-window,
-> or usage happened outside Claude Code). **If Claude Code or claude.ai
-> ever shows a different countdown than this tool, trust the app and run
-> `correct five_hour <timestamp>` to reconcile** — don't assume the app is
-> the one that's wrong.
+Once the alarm is scheduled, this Mac is out of the loop completely — close
+it, and the notification still lands on time.
 
+> **Heads up:** the in-app/CLI countdown is always the source of truth, not
+> this tool. If they ever disagree, trust the app and run
+> `correct five_hour <timestamp>` to reconcile.
 
-
-**The weekly cap** is tracked separately for Opus vs. all other models, and
-its exact reset mechanics aren't publicly documented (rolling-from-first-use
-like the 5-hour window? fixed weekly boundary? unknown). So this tool never
-guesses at it — it only moves when you explicitly `correct weekly <timestamp>`
-with a real value you've seen somewhere.
-
-**Delivery is a cloud one-shot timer, not local polling.** The moment a
-`reset_at` becomes known — `record` opening a new window, `correct`, or
-`hit-limit` recognizing a real field — the script schedules a single
-delayed message with [Upstash QStash](https://upstash.com/docs/qstash) that
-fires *directly at the Telegram Bot API* at that exact timestamp
-(`Upstash-Not-Before`, an absolute unix time). That means delivery does
-**not** depend on this machine being awake at reset time — only at the
-moment `reset_at` was *computed*, which is inherently true anyway (that's
-when a Claude Code hook just fired). If `reset_at` later changes — a
-`correct`, or `hit-limit` narrowing an inferred time — the old QStash
-message is cancelled and a new one scheduled; state tracks the active
-`qstash_message_id` per window.
-
-`check` (still run by `launchd` every 5 min) is now a **fallback and status
-sync**, not the primary delivery path: once a QStash-covered `reset_at` has
-passed, it queries QStash's own logs API to confirm the message was
-actually `DELIVERED` before marking `notified=True` — scheduling
-succeeding isn't treated as proof of delivery. If QStash reports a
-permanent failure (revoked bot token, bad chat id) or 30 minutes pass with
-no confirmation, it sends directly instead, so a scheduled alarm that
-silently never arrives doesn't mean silence forever. It also sends
-directly (immediately, no waiting) for a window that never got a
-`qstash_message_id` at all — e.g. this machine was offline at the moment
-`record`/`correct`/`hit-limit` ran and QStash scheduling failed. See
-[Architecture history](#architecture-history) for why this mattered.
-
-**`hit-limit`** is wired to Claude Code's `StopFailure` hook (matcher
-`rate_limit`, added in CLI v2.1.78) — it fires the instant a turn ends
-because you actually got rate-limited. That's a real, fully local signal
-with no scraping involved, but Anthropic hasn't published the exact JSON
-payload shape yet ([anthropics/claude-code#35620](https://github.com/anthropics/claude-code/issues/35620)).
-So `hit-limit` always logs the raw payload to `stop_failure_events.jsonl`
-and only updates `reset_at` (and reschedules the QStash alarm) if it
-recognizes a timestamp or retry-delay key in it — everything in that key
-list is an educated guess until a real payload proves otherwise (see
-[Known gaps](#known-gaps)).
-
-## Does the laptop need to stay open?
-
-**To detect a reset, yes — to deliver the notification, no.** These are two
-different jobs:
-
-- **Computing `reset_at`** only happens when a Claude Code hook fires
-  (`record`/`hit-limit`), which by definition requires you to be actively
-  using Claude Code on this machine. There's no way around this — the tool
-  only knows about activity it can see.
-- **Firing the notification at the right time** is fully offloaded to
-  QStash the instant `reset_at` is known. If you close the laptop 10
-  seconds after starting a session, the alarm for "5 hours from now" is
-  already scheduled in the cloud — it'll fire on time regardless of whether
-  the laptop is open, asleep, or fully shut down.
-
-Nothing needs to be visibly "running" either — there's no persistent
-process. It's Claude Code hooks (event-driven) plus a `launchd` job that
-polls every 5 min purely as a fallback/status-sync, not the delivery path.
+**→ Full internals — every design decision, every real bug this hit, exact
+QStash/Telegram wiring: [SYSTEMDESIGN.md](SYSTEMDESIGN.md).**
 
 ## Directory layout
 
@@ -100,7 +60,6 @@ Claude-Efficiency/
 ├── README.md                            this file
 ├── SYSTEMDESIGN.md                       in-depth technical explanation of how this was built
 ├── FUTUREWORK.md                         possible future improvements/integrations
-├── .env                                  QStash credentials from Upstash's dashboard (gitignored)
 ├── .gitignore
 └── claude-usage-watcher/
     ├── claude_usage_watcher.py          the tool itself (record / hit-limit / check / correct / status)
