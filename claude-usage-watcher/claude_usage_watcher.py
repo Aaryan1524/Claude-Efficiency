@@ -3,7 +3,7 @@
 claude_usage_watcher.py
 ========================
 Tracks Claude's rolling usage window(s) locally and pushes a phone
-notification (via ntfy.sh) the moment one resets.
+notification (via a Telegram bot) the moment one resets.
 
 WHY IT WORKS THIS WAY
 ----------------------
@@ -44,16 +44,36 @@ its exact mechanics (e.g. whether it's rolling-from-first-use like the
 a guess. Seed it with `correct weekly <timestamp>` whenever you see a real
 value and this tool will track it from there.
 
+DELIVERY: A CLOUD ONE-SHOT TIMER, NOT LOCAL POLLING
+----------------------------------------------------
+The moment a reset_at becomes known (record opening a new window, correct,
+or hit-limit recognizing a real field), this tool schedules a single
+delayed message with Upstash QStash that fires *directly* at the Telegram
+Bot API at that exact timestamp (Upstash-Not-Before). That means delivery
+does not depend on this machine being awake at reset time -- only on it
+being awake at the moment reset_at was *computed*, which is inherently
+true anyway since that's when a Claude Code hook just fired. If reset_at
+changes (a correction, or hit-limit narrowing an inferred time), the old
+QStash message is cancelled and a new one scheduled -- state tracks the
+active `qstash_message_id` per window.
+
+`check` (still run periodically by launchd) no longer sends the push
+itself in the common case -- it only mirrors `notified=True` locally once
+a QStash-covered reset_at has passed, for accurate `status` output. It
+only falls back to sending directly (the old ntfy/Telegram-polling
+behavior) if no QStash message was ever successfully scheduled for that
+window (e.g. this machine was offline at record time) -- see cmd_check.
+
 SETUP
 -----
-See README.md in this directory for full setup instructions (hooks,
-launchd job, ntfy topic).
+See ../README.md (repo root) for full setup instructions (hooks, launchd
+job, Telegram bot token + chat id, QStash token).
 
 USAGE
 -----
   claude_usage_watcher.py record                    call this from the UserPromptSubmit hook
   claude_usage_watcher.py hit-limit                  call this from the StopFailure(rate_limit) hook
-  claude_usage_watcher.py check [--dry-run]          call this from the scheduler
+  claude_usage_watcher.py check [--dry-run]          call this from the scheduler (fallback + status bookkeeping)
   claude_usage_watcher.py correct five_hour <ISO8601 timestamp>
   claude_usage_watcher.py correct weekly <ISO8601 timestamp>
   claude_usage_watcher.py status                     human-readable dump
@@ -64,6 +84,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -72,9 +93,37 @@ STATE_PATH = Path(
     os.environ.get("CLAUDE_NOTIFIER_STATE", "~/.claude-usage-watcher/state.json")
 ).expanduser()
 
+SECRETS_PATH = Path(
+    os.environ.get("CLAUDE_NOTIFIER_SECRETS", "~/.claude-usage-watcher/secrets.env")
+).expanduser()
+
 FIVE_HOUR_WINDOW = timedelta(hours=5)
-NTFY_TOPIC_ENV = "CLAUDE_NOTIFIER_NTFY_TOPIC"
-NTFY_SERVER = os.environ.get("CLAUDE_NOTIFIER_NTFY_SERVER", "https://ntfy.sh")
+TELEGRAM_BOT_TOKEN_ENV = "CLAUDE_NOTIFIER_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID_ENV = "CLAUDE_NOTIFIER_TELEGRAM_CHAT_ID"
+QSTASH_TOKEN_ENV = "CLAUDE_NOTIFIER_QSTASH_TOKEN"
+QSTASH_URL_ENV = "CLAUDE_NOTIFIER_QSTASH_URL"
+
+RESET_LABELS = {
+    "five_hour": "5-hour Claude usage window",
+    "weekly": "Weekly Claude usage cap",
+}
+
+
+def load_secrets_into_env() -> None:
+    """Read KEY=VALUE lines from SECRETS_PATH and set them into os.environ,
+    without overriding anything already explicitly set. This is the primary
+    way secrets reach the process -- Claude Code hooks and launchd don't
+    reliably share the same environment, so a fixed local file is more
+    robust than depending on either one's env propagation."""
+    if not SECRETS_PATH.exists():
+        return
+    for line in SECRETS_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
 
 
 def now_utc() -> datetime:
@@ -120,14 +169,16 @@ def cmd_record(_args) -> None:
     now = now_utc()
 
     if reset_at is None or now >= parse_iso(reset_at):
+        new_reset_at = now + FIVE_HOUR_WINDOW
         state["five_hour"] = {
             "window_start": now.isoformat(),
-            "reset_at": (now + FIVE_HOUR_WINDOW).isoformat(),
+            "reset_at": new_reset_at.isoformat(),
             "notified": False,
             "source": "inferred",
+            "qstash_message_id": schedule_alarm("five_hour", new_reset_at),
         }
         save_state(state)
-    # else: window already open, nothing to do.
+    # else: window already open, nothing to do -- alarm already scheduled.
 
 
 def cmd_correct(args) -> None:
@@ -139,10 +190,15 @@ def cmd_correct(args) -> None:
     target_time = parse_iso(args.timestamp)
 
     state = load_state()
+    old_message_id = (state.get(kind) or {}).get("qstash_message_id")
+    if old_message_id:
+        cancel_alarm(old_message_id)
+
     state[kind] = {
         "reset_at": target_time.isoformat(),
         "notified": False,
         "source": "observed",
+        "qstash_message_id": schedule_alarm(kind, target_time),
     }
     save_state(state)
     print(f"{kind}: reset_at set to {fmt_local(target_time)}")
@@ -177,46 +233,53 @@ def cmd_hit_limit(_args) -> None:
     five = state.setdefault("five_hour", {})
     five["confirmed_blocked_at"] = now.isoformat()
 
-    updated = False
+    new_reset_at = None
+    new_source = None
     for key in ("reset_at", "resets_at", "reset_time"):
         if key in payload:
             try:
-                five["reset_at"] = parse_iso(payload[key]).isoformat()
-                five["notified"] = False
-                five["source"] = f"stop_failure:{key}"
-                updated = True
+                new_reset_at = parse_iso(payload[key])
+                new_source = f"stop_failure:{key}"
             except (ValueError, TypeError):
                 pass
             break
 
-    if not updated:
+    if new_reset_at is None:
         for key, is_ms in (("retry_after_ms", True), ("retry_after_seconds", False), ("retry_after", False)):
             if key in payload:
                 try:
                     seconds = float(payload[key]) / (1000 if is_ms else 1)
-                    five["reset_at"] = (now + timedelta(seconds=seconds)).isoformat()
-                    five["notified"] = False
-                    five["source"] = f"stop_failure:{key}"
+                    new_reset_at = now + timedelta(seconds=seconds)
+                    new_source = f"stop_failure:{key}"
                 except (ValueError, TypeError):
                     pass
                 break
+
+    if new_reset_at is not None:
+        old_message_id = five.get("qstash_message_id")
+        if old_message_id:
+            cancel_alarm(old_message_id)
+        five["reset_at"] = new_reset_at.isoformat()
+        five["notified"] = False
+        five["source"] = new_source
+        five["qstash_message_id"] = schedule_alarm("five_hour", new_reset_at)
 
     save_state(state)
 
 
 def cmd_check(args) -> None:
-    """Call from the scheduler every few minutes. Fires an ntfy.sh push
-    exactly once per window when the stored reset_at time has passed."""
+    """Call from the scheduler every few minutes. In the common case the
+    push was already fired directly by QStash at the exact reset moment,
+    independent of this machine being awake -- so this just mirrors
+    notified=True locally once reset_at has passed, for accurate `status`
+    output. It only sends directly (the old always-local behavior) as a
+    fallback, for a window that never got a qstash_message_id scheduled
+    (e.g. this machine was offline when record/correct/hit-limit ran)."""
     state = load_state()
     now = now_utc()
     changed = False
 
-    labels = {
-        "five_hour": "5-hour Claude usage window",
-        "weekly": "Weekly Claude usage cap",
-    }
-
-    for kind, label in labels.items():
+    for kind, label in RESET_LABELS.items():
         entry = state.get(kind)
         if not entry or not entry.get("reset_at"):
             continue
@@ -225,14 +288,22 @@ def cmd_check(args) -> None:
 
         reset_at = parse_iso(entry["reset_at"])
         if now >= reset_at:
+            covered_by_qstash = bool(entry.get("qstash_message_id"))
             message = f"{label} just reset. Go."
+
             if args.dry_run:
                 # Preview only -- never mutate state, so a real check
                 # afterwards still fires for real.
-                print(f"[dry-run] would notify: {message}")
+                if covered_by_qstash:
+                    print(f"[dry-run] would mark notified (QStash already delivered): {message}")
+                else:
+                    print(f"[dry-run] would notify directly (no QStash alarm was scheduled): {message}")
                 continue
 
-            if send_ntfy(message, title="Claude usage reset"):
+            if covered_by_qstash:
+                entry["notified"] = True
+                changed = True
+            elif send_telegram(f"*Claude usage reset*\n{message}"):
                 entry["notified"] = True
                 changed = True
             # else: leave notified=False so the next tick retries.
@@ -268,27 +339,106 @@ def cmd_status(_args) -> None:
 
 
 # --------------------------------------------------------------------------
-# ntfy.sh
+# QStash -- schedules a one-shot delayed delivery straight to Telegram,
+# so the actual push doesn't depend on this machine being awake at
+# reset_at, only at the moment reset_at was computed.
 # --------------------------------------------------------------------------
 
-def send_ntfy(message: str, title: str = None) -> bool:
-    topic = os.environ.get(NTFY_TOPIC_ENV)
-    if not topic:
+def schedule_alarm(kind: str, reset_at: datetime):
+    """Schedule a QStash message that hits the Telegram Bot API directly
+    at reset_at (Upstash-Not-Before, an absolute unix timestamp -- not a
+    relative delay, so it's immune to any gap between computing reset_at
+    and this call actually firing). Returns the QStash messageId on
+    success, or None (never raises) -- callers store None just like a
+    real id; cmd_check's fallback path treats a missing id as "never
+    successfully scheduled" and sends directly instead."""
+    token = os.environ.get(QSTASH_TOKEN_ENV)
+    base_url = os.environ.get(QSTASH_URL_ENV)
+    bot_token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV)
+    chat_id = os.environ.get(TELEGRAM_CHAT_ID_ENV)
+    if not all((token, base_url, bot_token, chat_id)):
         print(
-            f"error: set {NTFY_TOPIC_ENV} to your ntfy.sh topic name",
+            f"warning: missing one of {QSTASH_TOKEN_ENV}/{QSTASH_URL_ENV}/"
+            f"{TELEGRAM_BOT_TOKEN_ENV}/{TELEGRAM_CHAT_ID_ENV} -- "
+            "no cloud alarm scheduled, `check` will fall back to direct send",
+            file=sys.stderr,
+        )
+        return None
+
+    message = f"*Claude usage reset*\n{RESET_LABELS.get(kind, kind)} just reset. Go."
+    destination = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    publish_url = f"{base_url.rstrip('/')}/v2/publish/{destination}"
+    body = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown",
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        publish_url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Upstash-Forward-Content-Type": "application/x-www-form-urlencoded",
+            "Upstash-Not-Before": str(int(reset_at.timestamp())),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+        return result.get("messageId")
+    except (urllib.error.URLError, json.JSONDecodeError) as e:
+        print(f"warning: failed to schedule QStash alarm ({e})", file=sys.stderr)
+        return None
+
+
+def cancel_alarm(message_id: str) -> None:
+    """Best-effort delete of a previously scheduled QStash message (e.g.
+    superseded by a `correct` or a hit-limit update). Safe to call on an
+    id that already fired -- QStash 404s, which we swallow."""
+    token = os.environ.get(QSTASH_TOKEN_ENV)
+    base_url = os.environ.get(QSTASH_URL_ENV)
+    if not token or not base_url:
+        return
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v2/messages/{message_id}",
+        method="DELETE",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+    except urllib.error.URLError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Telegram
+# --------------------------------------------------------------------------
+
+def send_telegram(message: str) -> bool:
+    token = os.environ.get(TELEGRAM_BOT_TOKEN_ENV)
+    chat_id = os.environ.get(TELEGRAM_CHAT_ID_ENV)
+    if not token or not chat_id:
+        print(
+            f"error: set {TELEGRAM_BOT_TOKEN_ENV} and {TELEGRAM_CHAT_ID_ENV}",
             file=sys.stderr,
         )
         return False
 
-    url = f"{NTFY_SERVER.rstrip('/')}/{topic}"
-    headers = {"Title": title} if title else {}
-    req = urllib.request.Request(url, data=message.encode("utf-8"), headers=headers, method="POST")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown",
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp.read()
         return True
     except urllib.error.URLError as e:
-        print(f"error: failed to reach ntfy ({e})", file=sys.stderr)
+        print(f"error: failed to reach Telegram ({e})", file=sys.stderr)
         return False
 
 
@@ -317,6 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    load_secrets_into_env()
     parser = build_parser()
     args = parser.parse_args()
 

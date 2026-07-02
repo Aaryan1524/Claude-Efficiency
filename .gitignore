@@ -1,0 +1,13 @@
+# secrets - never commit
+.env
+.env.*
+*.pem
+*.key
+
+# local state / runtime artifacts (also live outside the repo, but just in case)
+claude-usage-watcher/__pycache__/
+*.pyc
+
+# installed plist copies with real secrets baked in should never be authored here,
+# but guard against an accidental local copy anyway
+claude-usage-watcher/launchd/*.local.plist
