@@ -1,4 +1,4 @@
-# System Design: claude-usage-watcher
+# System Design: Sentinel (claude-usage-watcher)
 
 This document explains, in plain language, how this whole system actually
 works under the hood — every moving piece, why it exists, and the real

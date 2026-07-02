@@ -1,4 +1,4 @@
-# Future Work: claude-usage-watcher
+# Future Work: Sentinel (claude-usage-watcher)
 
 Ideas for extending this system, roughly ordered by how much value they'd
 add relative to the effort. None of this is required — the system works

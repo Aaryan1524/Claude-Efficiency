@@ -1,57 +1,65 @@
 <div align="center">
-
-# 🔔 claude-usage-watcher
-
-**Stop refreshing claude.ai. Get pinged the instant your usage limit resets.**
-
-Tracks Claude Code's 5-hour usage window locally and delivers a phone
-notification the moment it resets — even if your laptop is closed, asleep,
-or off.
-
-`macOS` · `zero dependencies` · `Telegram` · `Upstash QStash`
-
+  <h1>Sentinel</h1>
 </div>
 
----
+<div align="center">
+  <h3>Know the instant your Claude usage window resets — even with your laptop closed.</h3>
+</div>
 
-## Why
+<div align="center">
+  <img src="https://img.shields.io/badge/platform-macOS-black" alt="Platform: macOS">
+  <img src="https://img.shields.io/badge/dependencies-zero-brightgreen" alt="Zero dependencies">
+  <img src="https://img.shields.io/badge/python-stdlib%20only-blue" alt="Python: stdlib only">
+  <img src="https://img.shields.io/badge/delivery-Telegram%20%2B%20QStash-2CA5E0" alt="Delivery: Telegram + QStash">
+</div>
 
-Anthropic doesn't publish a "your limit just reset" webhook. This tool
-infers the reset time locally from one documented fact — the 5-hour window
-always resets exactly 5 hours after your first message — the instant a
-Claude Code hook sees that first message. No polling, no browser, no
-manually checking a usage page.
+<br>
 
-## Features
+Sentinel watches Claude Code activity on this machine, computes exactly
+when your 5-hour usage window resets, and hands delivery off to the cloud
+the instant it knows — so the notification arrives on time whether your
+laptop is open, asleep, or off.
+
+```bash
+cd claude-usage-watcher && ./install.sh
+```
+
+> [!TIP]
+> The in-app/CLI countdown is always the source of truth, not Sentinel. If
+> they ever disagree, run `correct five_hour <timestamp>` to reconcile.
+
+## Why use Sentinel?
+
+Anthropic doesn't publish a "your limit just reset" webhook — the only
+ground truth is built for humans to read, not machines to poll. Sentinel
+closes that gap:
 
 - **Event-driven, not polling** — a Claude Code hook computes the reset
-  time the moment a new window opens
+  time the instant a new window opens; nothing runs continuously.
 - **Cloud-delivered** — [Upstash QStash](https://upstash.com/docs/qstash)
   fires the push straight to Telegram at the exact second; your laptop is
-  out of the loop the instant the alarm is scheduled
-- **Delivery-confirmed, not fire-and-forget** — verifies the message
-  actually reached Telegram, with an automatic fallback if it didn't
+  out of the loop the moment the alarm is scheduled.
+- **Delivery-confirmed** — verifies the message actually reached Telegram
+  before considering the job done, with an automatic fallback if it didn't.
 - **Self-correcting** — one command reconciles drift the moment you spot
-  it against the real countdown
+  it against the real countdown.
 - **Zero dependencies** — one Python file, standard library only, nothing
-  to `pip install`, ever
-
-## How it works
+  to `pip install`, ever.
 
 ```
 Claude Code hook  →  claude_usage_watcher.py  →  Upstash QStash  →  Telegram
    (this Mac)          (computes reset_at)        (cloud alarm)      (your phone)
 ```
 
-Once the alarm is scheduled, this Mac is out of the loop completely — close
-it, and the notification still lands on time.
+---
 
-> **Heads up:** the in-app/CLI countdown is always the source of truth, not
-> this tool. If they ever disagree, trust the app and run
-> `correct five_hour <timestamp>` to reconcile.
+## Documentation
 
-**→ Full internals — every design decision, every real bug this hit, exact
-QStash/Telegram wiring: [SYSTEMDESIGN.md](SYSTEMDESIGN.md).**
+- **[SYSTEMDESIGN.md](SYSTEMDESIGN.md)** — every design decision, every
+  real bug this hit, and exactly how the QStash/Telegram wiring works
+- **[FUTUREWORK.md](FUTUREWORK.md)** — possible extensions, roughly ranked
+  by effort vs. value
+- Setup, usage, and troubleshooting — below
 
 ## Directory layout
 
